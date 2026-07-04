@@ -429,10 +429,10 @@ fn encode_ltr_round_trip() -> Result<()> {
 #[ignore = "requires ~2.8GB NV12 file and takes ~30s"]
 fn encode_with_packet_loss_ltr_vs_no_ltr() -> Result<()> {
     let _ = SimpleLogger::new().init();
-    let (w, h, fps) = (1920, 1080, 30usize);
+    let (w, h, fps) = (1920u32, 1080u32, 30usize);
     let num_frames = fps * 30;
     let degrade = fps * 5..fps * 25;
-    let frame_size = w * h * 3 / 2;
+    let frame_size = w as usize * h as usize * 3 / 2;
 
     let data = fs::read("nv-video-codec/resources/test/people_walking_1080p.nv12")?;
     assert!(data.len() >= num_frames * frame_size);
