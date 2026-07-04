@@ -417,23 +417,24 @@ fn encode_ltr_round_trip() -> Result<()> {
     Ok(())
 }
 
-/// Simulates network packet loss: encodes a 3K (3088×2076) static video
-/// twice — once with LTR enabled, once without — drops every Nth frame,
-/// and writes the decoded NV12 output to two files for comparison.
+/// Simulates network packet loss: encodes a 1080p video twice — once with
+/// LTR enabled, once without — drops every Nth frame, and writes the decoded
+/// NV12 output to two files for comparison.
 #[test]
 fn encode_with_packet_loss_ltr_vs_no_ltr() -> Result<()> {
     let _ = SimpleLogger::new().init();
-    let (w, h) = (3088, 2076);
+    let (w, h) = (1920, 1080);
     let num_frames: usize = 30;
     let drop_every: usize = 5;
 
-    let data = include_bytes!("../resources/test/decode_out_3k.nv12");
+    let data = include_bytes!("../resources/test/people_walking_1080p.nv12");
+    let frame_size = w as usize * h as usize * 3 / 2;
+    assert!(data.len() >= num_frames * frame_size, "not enough NV12 data for {num_frames} frames");
 
     // === WITH LTR ===
     let (ltr_decoded, ltr_bytes) = {
         let mut encoder = util_init_encoder(w, h, BufferFormat::NV12)?;
         util_create_encoder_ltr(&mut encoder, 4, LtrTrustMode::PerPicture)?;
-        assert_eq!(data.len(), encoder.get_frame_size()? as usize);
 
         let bitstream =
             encode_with_loss(&mut encoder, data, w, h, num_frames, drop_every, true)?;
@@ -444,7 +445,6 @@ fn encode_with_packet_loss_ltr_vs_no_ltr() -> Result<()> {
     let (no_ltr_decoded, no_ltr_bytes) = {
         let mut encoder = util_init_encoder(w, h, BufferFormat::NV12)?;
         util_create_encoder(&mut encoder)?;
-        assert_eq!(data.len(), encoder.get_frame_size()? as usize);
 
         let bitstream =
             encode_with_loss(&mut encoder, data, w, h, num_frames, drop_every, false)?;
@@ -504,8 +504,11 @@ fn encode_with_loss(
     let mut packet = Vec::new();
     let mut bitstream: Vec<(usize, Vec<u8>)> = Vec::new();
 
+    let frame_size = (w as usize * h as usize * 3 / 2) as usize;
+
     for i in 0..num_frames {
-        upload_nv12_data_to_cuda_resource(data, encoder.get_next_input_resource(), w, h);
+        let frame_data = &data[i * frame_size..(i + 1) * frame_size];
+        upload_nv12_data_to_cuda_resource(frame_data, encoder.get_next_input_resource(), w, h);
 
         let ts = i as u64;
         let pic_flags = if i == 0 {
