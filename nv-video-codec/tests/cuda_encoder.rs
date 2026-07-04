@@ -451,6 +451,7 @@ fn encode_with_packet_loss_ltr_vs_no_ltr() -> Result<()> {
         decode_bitstream_to_nv12(&bitstream)?
     };
 
+    fs::create_dir_all("target")?;
     fs::write("target/with_ltr_decoded.nv12", &ltr_bytes)?;
     fs::write("target/without_ltr_decoded.nv12", &no_ltr_bytes)?;
 
