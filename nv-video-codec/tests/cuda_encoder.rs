@@ -434,7 +434,8 @@ fn encode_with_packet_loss_ltr_vs_no_ltr() -> Result<()> {
     let degrade = fps * 5..fps * 25;
     let frame_size = w as usize * h as usize * 3 / 2;
 
-    let data = fs::read("nv-video-codec/resources/test/people_walking_1080p.nv12")?;
+    let data = fs::read("resources/test/people_walking_1080p.nv12")
+        .or_else(|_| fs::read("nv-video-codec/resources/test/people_walking_1080p.nv12"))?;
     assert!(data.len() >= num_frames * frame_size);
     fs::create_dir_all("target")?;
 
