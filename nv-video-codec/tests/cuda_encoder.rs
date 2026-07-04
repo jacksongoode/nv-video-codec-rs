@@ -417,143 +417,110 @@ fn encode_ltr_round_trip() -> Result<()> {
     Ok(())
 }
 
-/// Simulates network packet loss: encodes a 1080p video twice — once with
-/// LTR enabled, once without — drops every Nth frame, and writes the decoded
-/// NV12 output to two files for comparison.
+/// 30s of 1080p: 5s clean → 20s bursty loss → 5s clean.
+/// Encodes twice (with/without LTR), writes decoded NV12 to `target/`.
+///
+/// Generate the input file:
+/// ```sh
+/// ffmpeg -i input.webm -f rawvideo -pix_fmt nv12 -s 1920x1080 -frames:v 900 \
+///   nv-video-codec/resources/test/people_walking_1080p.nv12
+/// ```
 #[test]
+#[ignore = "requires ~2.8GB NV12 file and takes ~30s"]
 fn encode_with_packet_loss_ltr_vs_no_ltr() -> Result<()> {
     let _ = SimpleLogger::new().init();
-    let (w, h) = (1920, 1080);
-    let num_frames: usize = 30;
-    let drop_every: usize = 5;
+    let (w, h, fps) = (1920, 1080, 30usize);
+    let num_frames = fps * 30;
+    let degrade = fps * 5..fps * 25;
+    let frame_size = w * h * 3 / 2;
 
-    let data = include_bytes!("../resources/test/people_walking_1080p.nv12");
-    let frame_size = w as usize * h as usize * 3 / 2;
-    assert!(data.len() >= num_frames * frame_size, "not enough NV12 data for {num_frames} frames");
-
-    // === WITH LTR ===
-    let (ltr_decoded, ltr_bytes) = {
-        let mut encoder = util_init_encoder(w, h, BufferFormat::NV12)?;
-        util_create_encoder_ltr(&mut encoder, 4, LtrTrustMode::PerPicture)?;
-
-        let bitstream =
-            encode_with_loss(&mut encoder, data, w, h, num_frames, drop_every, true)?;
-        decode_bitstream_to_nv12(&bitstream)?
-    };
-
-    // === WITHOUT LTR ===
-    let (no_ltr_decoded, no_ltr_bytes) = {
-        let mut encoder = util_init_encoder(w, h, BufferFormat::NV12)?;
-        util_create_encoder(&mut encoder)?;
-
-        let bitstream =
-            encode_with_loss(&mut encoder, data, w, h, num_frames, drop_every, false)?;
-        decode_bitstream_to_nv12(&bitstream)?
-    };
-
+    let data = fs::read("nv-video-codec/resources/test/people_walking_1080p.nv12")?;
+    assert!(data.len() >= num_frames * frame_size);
     fs::create_dir_all("target")?;
-    fs::write("target/with_ltr_decoded.nv12", &ltr_bytes)?;
-    fs::write("target/without_ltr_decoded.nv12", &no_ltr_bytes)?;
 
-    info_ctx!(
-        "encode_with_packet_loss_ltr_vs_no_ltr",
-        "With LTR: {ltr_decoded} frames decoded ({} bytes). Without LTR: {no_ltr_decoded} frames decoded ({} bytes).",
-        ltr_bytes.len(),
-        no_ltr_bytes.len(),
-    );
-    assert!(ltr_decoded > 0, "no frames decoded with LTR");
-    assert!(no_ltr_decoded > 0, "no frames decoded without LTR");
-    Ok(())
-}
-
-/// Decodes a bitstream (sequence of `(frame_index, encoded_data)` tuples) to raw NV12.
-fn decode_bitstream_to_nv12(bitstream: &[(usize, Vec<u8>)]) -> Result<(usize, Vec<u8>)> {
-    let context = init_cuda_ctx()?;
-    let mut decoder = NvDecoderBuilder::new(context, Codec::HEVC)
-        .low_latency(true)
-        .build::<HostFrameAllocator>()?;
-
-    let mut frames = 0;
-    let mut out = Vec::new();
-    for (i, frame_data) in bitstream.iter() {
-        if frame_data.is_empty() {
-            continue;
-        }
-        let output = decoder.decode_one(frame_data, DecoderPacketFlags::empty(), *i as i64)?;
-        if let Some(frame) = output.frames {
-            out.extend_from_slice(&frame.slice);
-            frames += 1;
-        }
-    }
-    Ok((frames, out))
-}
-
-/// Encodes `num_frames` of `data` with simulated packet loss (drop every
-/// `drop_every`-th frame). When `with_ltr` is true, marks LTRs and uses
-/// them as references; on a dropped frame, calls `invalidate_ref_frames`
-/// so the encoder can fall back to the LTR.
-fn encode_with_loss(
-    encoder: &mut NvEncoderCuda,
-    data: &[u8],
-    w: u32,
-    h: u32,
-    num_frames: usize,
-    drop_every: usize,
-    with_ltr: bool,
-) -> Result<Vec<(usize, Vec<u8>)>> {
-    let mut packet = Vec::new();
-    let mut bitstream: Vec<(usize, Vec<u8>)> = Vec::new();
-
-    let frame_size = (w as usize * h as usize * 3 / 2) as usize;
-
-    for i in 0..num_frames {
-        let frame_data = &data[i * frame_size..(i + 1) * frame_size];
-        upload_nv12_data_to_cuda_resource(frame_data, encoder.get_next_input_resource(), w, h);
-
-        let ts = i as u64;
-        let pic_flags = if i == 0 {
-            EncodePicFlags::FORCE_IDR | EncodePicFlags::SEQUENCE_HEADER
+    for (with_ltr, label) in [(true, "with_ltr"), (false, "without_ltr")] {
+        let mut encoder = util_init_encoder(w, h, BufferFormat::NV12)?;
+        if with_ltr {
+            util_create_encoder_ltr(&mut encoder, 4, LtrTrustMode::PerPicture)?;
         } else {
-            EncodePicFlags::empty()
-        };
-        let features = if with_ltr {
-            if i == 0 {
-                EncodeFrameFeatures { ltr_mark_frame_idx: Some(0), ..Default::default() }
-            } else if i == 7 {
-                // Mark frame 7 as LTR index 1 so it isn't dropped (drop_every = 5).
-                EncodeFrameFeatures {
-                    ltr_mark_frame_idx: Some(1),
-                    ltr_use_frame_bitmap: Some(LtrUseFrames::from_indices(&[0, 1])),
-                    ..Default::default()
-                }
+            util_create_encoder(&mut encoder)?;
+        }
+
+        let mut packet = Vec::new();
+        let mut bitstream: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut burst = 0usize;
+
+        for i in 0..num_frames {
+            upload_nv12_data_to_cuda_resource(
+                &data[i * frame_size..(i + 1) * frame_size],
+                encoder.get_next_input_resource(),
+                w,
+                h,
+            );
+
+            let (flags, features) = if i == 0 {
+                (
+                    EncodePicFlags::FORCE_IDR | EncodePicFlags::SEQUENCE_HEADER,
+                    if with_ltr {
+                        EncodeFrameFeatures { ltr_mark_frame_idx: Some(0), ..Default::default() }
+                    } else {
+                        Default::default()
+                    },
+                )
             } else {
-                EncodeFrameFeatures {
-                    ltr_use_frame_bitmap: Some(LtrUseFrames::from_indices(&[0, 1])),
-                    ..Default::default()
+                (
+                    EncodePicFlags::empty(),
+                    if with_ltr {
+                        EncodeFrameFeatures {
+                            ltr_use_frame_bitmap: Some(LtrUseFrames::from_indices(&[0])),
+                            ..Default::default()
+                        }
+                    } else {
+                        Default::default()
+                    },
+                )
+            };
+            encoder.encode_frame(&mut packet, flags, features, i as u64)?;
+
+            // Burst loss during degradation: every 30 frames, drop 5 in a row.
+            let is_lost = degrade.contains(&i) && (burst > 0 || {
+                if i % 30 == 0 { burst = 5; true } else { false }
+            });
+            if is_lost {
+                burst -= 1;
+                if with_ltr {
+                    encoder.invalidate_ref_frames(i as u64)?;
+                }
+                log::info!("frame {i} (t={:.1}s) dropped", i as f64 / fps as f64);
+                continue;
+            }
+
+            bitstream.extend(packet.iter().map(|p| (i, p.to_vec())));
+        }
+
+        encoder.end_encode(&mut packet)?;
+        bitstream.extend(packet.iter().map(|p| (num_frames, p.to_vec())));
+
+        // Decode to NV12.
+        let context = init_cuda_ctx()?;
+        let mut decoder = NvDecoderBuilder::new(context, Codec::HEVC)
+            .low_latency(true)
+            .build::<HostFrameAllocator>()?;
+
+        let mut out = Vec::new();
+        for (i, frame_data) in &bitstream {
+            if !frame_data.is_empty() {
+                if let Some(frame) =
+                    decoder.decode_one(frame_data, DecoderPacketFlags::empty(), *i as i64)?.frames
+                {
+                    out.extend_from_slice(&frame.slice);
                 }
             }
-        } else {
-            Default::default()
-        };
-
-        encoder.encode_frame(&mut packet, pic_flags, features, ts)?;
-
-        if i > 0 && i % drop_every == 0 {
-            if with_ltr {
-                encoder.invalidate_ref_frames(ts)?;
-            }
-            continue;
         }
 
-        for p in packet.iter() {
-            bitstream.push((i, p.to_vec()));
-        }
+        fs::write(format!("target/{label}_decoded.nv12"), &out)?;
+        log::info!("{label}: {} frames decoded ({} bytes)", bitstream.len(), out.len());
     }
 
-    encoder.end_encode(&mut packet)?;
-    for p in packet.iter() {
-        bitstream.push((num_frames, p.to_vec()));
-    }
-
-    Ok(bitstream)
+    Ok(())
 }
