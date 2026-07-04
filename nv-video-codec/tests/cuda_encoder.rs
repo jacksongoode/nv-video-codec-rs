@@ -20,6 +20,7 @@ use nv_video_codec::{
 };
 use simple_logger::SimpleLogger;
 use std::{
+    fs,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -414,4 +415,141 @@ fn encode_ltr_round_trip() -> Result<()> {
     // Check we decoded at least one frame.
     assert!(decoded > 0, "no frames decoded from LTR bitstream");
     Ok(())
+}
+
+/// Simulates network packet loss: encodes a 3K (3088×2076) static video
+/// twice — once with LTR enabled, once without — drops every Nth frame,
+/// and writes the decoded NV12 output to two files for comparison.
+#[test]
+fn encode_with_packet_loss_ltr_vs_no_ltr() -> Result<()> {
+    let _ = SimpleLogger::new().init();
+    let (w, h) = (3088, 2076);
+    let num_frames: usize = 30;
+    let drop_every: usize = 5;
+
+    let data = include_bytes!("../resources/test/decode_out_3k.nv12");
+
+    // === WITH LTR ===
+    let (ltr_decoded, ltr_bytes) = {
+        let mut encoder = util_init_encoder(w, h, BufferFormat::NV12)?;
+        util_create_encoder_ltr(&mut encoder, 4, LtrTrustMode::PerPicture)?;
+        assert_eq!(data.len(), encoder.get_frame_size()? as usize);
+
+        let bitstream =
+            encode_with_loss(&mut encoder, data, w, h, num_frames, drop_every, true)?;
+        decode_bitstream_to_nv12(&bitstream)?
+    };
+
+    // === WITHOUT LTR ===
+    let (no_ltr_decoded, no_ltr_bytes) = {
+        let mut encoder = util_init_encoder(w, h, BufferFormat::NV12)?;
+        util_create_encoder(&mut encoder)?;
+        assert_eq!(data.len(), encoder.get_frame_size()? as usize);
+
+        let bitstream =
+            encode_with_loss(&mut encoder, data, w, h, num_frames, drop_every, false)?;
+        decode_bitstream_to_nv12(&bitstream)?
+    };
+
+    fs::write("target/with_ltr_decoded.nv12", &ltr_bytes)?;
+    fs::write("target/without_ltr_decoded.nv12", &no_ltr_bytes)?;
+
+    info_ctx!(
+        "encode_with_packet_loss_ltr_vs_no_ltr",
+        "With LTR: {ltr_decoded} frames decoded ({} bytes). Without LTR: {no_ltr_decoded} frames decoded ({} bytes).",
+        ltr_bytes.len(),
+        no_ltr_bytes.len(),
+    );
+    assert!(ltr_decoded > 0, "no frames decoded with LTR");
+    assert!(no_ltr_decoded > 0, "no frames decoded without LTR");
+    Ok(())
+}
+
+/// Decodes a bitstream (sequence of `(frame_index, encoded_data)` tuples) to raw NV12.
+fn decode_bitstream_to_nv12(bitstream: &[(usize, Vec<u8>)]) -> Result<(usize, Vec<u8>)> {
+    let context = init_cuda_ctx()?;
+    let mut decoder = NvDecoderBuilder::new(context, Codec::HEVC)
+        .low_latency(true)
+        .build::<HostFrameAllocator>()?;
+
+    let mut frames = 0;
+    let mut out = Vec::new();
+    for (i, frame_data) in bitstream.iter() {
+        if frame_data.is_empty() {
+            continue;
+        }
+        let output = decoder.decode_one(frame_data, DecoderPacketFlags::empty(), *i as i64)?;
+        if let Some(frame) = output.frames {
+            out.extend_from_slice(&frame.slice);
+            frames += 1;
+        }
+    }
+    Ok((frames, out))
+}
+
+/// Encodes `num_frames` of `data` with simulated packet loss (drop every
+/// `drop_every`-th frame). When `with_ltr` is true, marks LTRs and uses
+/// them as references; on a dropped frame, calls `invalidate_ref_frames`
+/// so the encoder can fall back to the LTR.
+fn encode_with_loss(
+    encoder: &mut NvEncoderCuda,
+    data: &[u8],
+    w: u32,
+    h: u32,
+    num_frames: usize,
+    drop_every: usize,
+    with_ltr: bool,
+) -> Result<Vec<(usize, Vec<u8>)>> {
+    let mut packet = Vec::new();
+    let mut bitstream: Vec<(usize, Vec<u8>)> = Vec::new();
+
+    for i in 0..num_frames {
+        upload_nv12_data_to_cuda_resource(data, encoder.get_next_input_resource(), w, h);
+
+        let ts = i as u64;
+        let pic_flags = if i == 0 {
+            EncodePicFlags::FORCE_IDR | EncodePicFlags::SEQUENCE_HEADER
+        } else {
+            EncodePicFlags::empty()
+        };
+        let features = if with_ltr {
+            if i == 0 {
+                EncodeFrameFeatures { ltr_mark_frame_idx: Some(0), ..Default::default() }
+            } else if i == 7 {
+                // Mark frame 7 as LTR index 1 so it isn't dropped (drop_every = 5).
+                EncodeFrameFeatures {
+                    ltr_mark_frame_idx: Some(1),
+                    ltr_use_frame_bitmap: Some(LtrUseFrames::from_indices(&[0, 1])),
+                    ..Default::default()
+                }
+            } else {
+                EncodeFrameFeatures {
+                    ltr_use_frame_bitmap: Some(LtrUseFrames::from_indices(&[0, 1])),
+                    ..Default::default()
+                }
+            }
+        } else {
+            Default::default()
+        };
+
+        encoder.encode_frame(&mut packet, pic_flags, features, ts)?;
+
+        if i > 0 && i % drop_every == 0 {
+            if with_ltr {
+                encoder.invalidate_ref_frames(ts)?;
+            }
+            continue;
+        }
+
+        for p in packet.iter() {
+            bitstream.push((i, p.to_vec()));
+        }
+    }
+
+    encoder.end_encode(&mut packet)?;
+    for p in packet.iter() {
+        bitstream.push((num_frames, p.to_vec()));
+    }
+
+    Ok(bitstream)
 }
