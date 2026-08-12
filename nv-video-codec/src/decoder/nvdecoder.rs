@@ -50,6 +50,7 @@ pub struct NvDecoder<A: FrameAllocator> {
     allocated_frames: usize,
     stream: CUstream,
     // TODO(mbernat): This used to be wrapped in Arc<Mutex<_>>, find out why.
+    // Returned frames sit at the front; the next decode rotates them to the back for reuse.
     frames: VecDeque<OwnedFrame<A>>,
     picture_decode_index_mapping: [usize; 32],
     decoded_pictures: usize,
@@ -420,6 +421,7 @@ impl<A: FrameAllocator> NvDecoder<A> {
         }
 
         let working_frame = &mut self.frames[working_frame_index];
+        working_frame.timestamp = disp_info.timestamp;
 
         // SAFETY: The buffer pointer is only used to copy the luma and chroma data to it below.
         // In particular, it's not used to deallocate or otherwise invalidate the buffer.
@@ -590,9 +592,11 @@ impl<A: FrameAllocator> NvDecoder<A> {
     ) -> Result<DecodingOutput<Option<Frame<'_, A>>>, NvDecoderError> {
         let packet_flags = packet_flags | DecoderPacketFlags::END_OF_PICTURE;
         self.decode_packet(packet_data, packet_flags, packet_timestamp)?;
-        let frame = self.frames.front().map(|raw| raw.from_raw_parts());
+        self.decoded_frames_returned = usize::from(self.decoded_frames > 0);
+        let frame_count = self.decoded_frames_returned;
+        let frame = if frame_count > 0 { Some(self.frames[0].from_raw_parts()) } else { None };
 
-        Ok(DecodingOutput { frames: frame, frame_count: 1, frame_info: self.frame_info })
+        Ok(DecodingOutput { frames: frame, frame_count, frame_info: self.frame_info })
     }
 
     pub fn decode_many(
@@ -602,9 +606,11 @@ impl<A: FrameAllocator> NvDecoder<A> {
         packet_timestamp: i64,
     ) -> Result<DecodingOutput<impl Iterator<Item = Frame<'_, A>>>, NvDecoderError> {
         self.decode_packet(packet_data, packet_flags, packet_timestamp)?;
-        let frames = self.frames.iter().map(|raw| raw.from_raw_parts());
+        self.decoded_frames_returned = self.decoded_frames;
+        let frame_count = self.decoded_frames_returned;
+        let frames = self.frames.iter().take(frame_count).map(|raw| raw.from_raw_parts());
 
-        Ok(DecodingOutput { frames, frame_count: self.frames.len(), frame_info: self.frame_info })
+        Ok(DecodingOutput { frames, frame_count, frame_info: self.frame_info })
     }
 
     fn decode_packet(
@@ -613,7 +619,10 @@ impl<A: FrameAllocator> NvDecoder<A> {
         packet_flags: DecoderPacketFlags,
         packet_timestamp: i64,
     ) -> Result<(), NvDecoderError> {
-        self.decoded_frames = 0;
+        // Returned frames are now free to overwrite; move them to the back,
+        // keeping any unreturned pictures at the front in display order.
+        self.frames.rotate_left(self.decoded_frames_returned);
+        self.decoded_frames -= self.decoded_frames_returned;
         self.decoded_frames_returned = 0;
         let flags: CUvideopacketflags::Type = packet_flags.into();
         let mut packet = CUVIDSOURCEDATAPACKET {
